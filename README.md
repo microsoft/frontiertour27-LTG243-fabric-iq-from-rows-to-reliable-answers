@@ -92,7 +92,7 @@ By the end of this session, you will be able to:
 
 | Resource | What you'll get |
 |----------|-----------------|
-| **[Session Recording](https://aka.ms/aitour27/LTG243/youtube)** | A recording of session LTG243 by the session creator |
+| **[Session Recording](https://aka.ms/ft27/ltg243/youtube)** | A recording of session LTG243 by the session creator |
 | **[Microsoft Learn](https://learn.microsoft.com)** | Official documentation and guided learning paths on these topics |
 | **[Frontier Tour 2027 Resource Center](https://aka.ms/FrontierTour27)** | Additional session repos and materials from Frontier Tour 2027 |
 | **[Microsoft Foundry Community](https://aka.ms/MicrosoftFoundryDiscord-ft27)** | Connect with other learners and experts in our Discord community |
