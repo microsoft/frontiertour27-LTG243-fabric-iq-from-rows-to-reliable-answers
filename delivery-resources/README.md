@@ -1,7 +1,7 @@
 # LTG243 presenter runbook
 
 This repository owns the reproducible demo environment. The current deck and
-recording links are distributed through the AI Tour delivery system rather than
+recording links are distributed through the Frontier Tour delivery system rather than
 embedded with tenant-specific URLs here.
 
 ## Before travel

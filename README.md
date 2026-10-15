@@ -1,8 +1,8 @@
 <p align="center">
-<img src="img/banner-ai-tour-27.png" alt="Microsoft AI Tour 2027" width="100%"/>
+<img src="img/banner-frontier-tour-27.png" alt="Microsoft Frontier Tour 2027" width="100%"/>
 </p>
 
-# Microsoft AI Tour 2027
+# Microsoft Frontier Tour 2027
 
 ## LTG243: Fabric IQ - From rows to reliable answers
 
@@ -94,8 +94,8 @@ By the end of this session, you will be able to:
 |----------|-----------------|
 | **[Session Recording](https://aka.ms/aitour27/LTG243/youtube)** | A recording of session LTG243 by the session creator |
 | **[Microsoft Learn](https://learn.microsoft.com)** | Official documentation and guided learning paths on these topics |
-| **[AI Tour 2027 Resource Center](https://aka.ms/aitour27-resource-center)** | Additional session repos and materials from AI Tour 2027 |
-| **[Microsoft Foundry Community](https://aka.ms/MicrosoftFoundryDiscord-AITour27)** | Connect with other learners and experts in our Discord community |
+| **[Frontier Tour 2027 Resource Center](https://aka.ms/FrontierTour27)** | Additional session repos and materials from Frontier Tour 2027 |
+| **[Microsoft Foundry Community](https://aka.ms/MicrosoftFoundryDiscord-ft27)** | Connect with other learners and experts in our Discord community |
 
 The [Microsoft Learn MCP Server](https://aka.ms/learnmcp) can give an AI coding
 agent current first-party documentation while it helps with setup.
