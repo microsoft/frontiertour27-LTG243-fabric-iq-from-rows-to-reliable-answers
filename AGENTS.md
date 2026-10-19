@@ -7,7 +7,8 @@ the synthetic data under `data/`, the Fabric item definitions under
 ## Working rules
 
 - Read `instructions/README.md` before running deployment commands.
-- Use Node.js 24 or later and Fabio 0.71.0 or later.
+- Use Node.js 24 or later and the exact Fabio version pinned in `.fabio-version`
+  (0.79.0). Upgrade with `fabio upgrade --target-version 0.79.0` if needed.
 - Keep `data/scenario.json` frozen. Do not hardcode values already defined by
   the scenario.
 - Generated output must remain deterministic. Do not use current time or

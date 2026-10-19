@@ -396,14 +396,25 @@ function Check-Prerequisites {
     Fail "Node.js 24 or later is required; found $nodeVersion."
   }
 
+  $versionFile = Join-Path $Script:RootDir '.fabio-version'
+  if (-not (Test-Path -LiteralPath $versionFile -PathType Leaf)) {
+    Fail '.fabio-version is missing; restore the repository version pin.'
+  }
+  $requiredFabioVersion = (Get-Content -Raw -LiteralPath $versionFile).Trim()
+  if ($requiredFabioVersion -notmatch '^\d+\.\d+\.\d+$') {
+    Fail '.fabio-version must contain a release version such as 0.79.0.'
+  }
   $fabioCmd = Get-Command fabio -ErrorAction SilentlyContinue
   if (-not $fabioCmd) {
-    Fail 'fabio is required. Install fabio 0.70.0+ (0.71.0+ for Cosmos DB documents) and ensure it is on PATH.'
+    Fail "fabio is required. Install the pinned version $requiredFabioVersion and ensure it is on PATH."
   }
   $fabioVersion = (& fabio --version).Trim()
   $fabioExit = $LASTEXITCODE
   if ($fabioExit -ne 0) {
     Fail "fabio --version failed with exit code $fabioExit."
+  }
+  if ($fabioVersion -cne "fabio $requiredFabioVersion") {
+    Fail "Fabio $requiredFabioVersion is required by .fabio-version; found $fabioVersion. Run: fabio upgrade --target-version $requiredFabioVersion"
   }
 
   Write-Host "node: $nodeVersion"
@@ -464,39 +475,53 @@ function Invoke-Authentication {
   & fabio auth status *> $null
   $exitCode = $LASTEXITCODE
   if ($exitCode -ne 0) {
-    [Console]::Error.WriteLine("ERROR: fabio is not authenticated. Run this command, then retry:`n  fabio auth login")
+    [Console]::Error.WriteLine('ERROR: fabio is not authenticated. Complete the tenant-specific Azure CLI sign-in and fabio auth login in instructions/README.md, then retry. Native --browser login requires a customer-owned public-client ID.')
     exit 1
   }
 }
 
 function Resolve-Workspace {
+  $isWorkspaceId = $Script:Workspace -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
   if ($Script:DryRun) {
-    $query = "[?displayName=='$($Script:Workspace)'].id | [0]"
-    Write-DryRun @('fabio', 'workspace', 'show', '--id', $Script:Workspace, '--query', 'id', '--output', 'plain')
-    Write-DryRun @('fabio', 'workspace', 'list', '--all', '--query', $query, '--output', 'plain')
-    if (-not [string]::IsNullOrWhiteSpace($Script:Capacity)) {
-      Write-DryRun @('fabio', 'workspace', 'create', '--name', $Script:Workspace, '--capacity-id', $Script:Capacity, '--query', 'id', '--output', 'plain')
+    if ($isWorkspaceId) {
+      Write-DryRun @('fabio', 'workspace', 'show', '--id', $Script:Workspace, '--query', 'id', '--output', 'plain')
     } else {
-      Write-DryRun @('fabio', 'workspace', 'create', '--name', $Script:Workspace, '--query', 'id', '--output', 'plain')
+      $query = "[?displayName=='$($Script:Workspace)'].id | [0]"
+      Write-DryRun @('fabio', 'workspace', 'list', '--all', '--query', $query, '--output', 'plain')
+      if (-not $Script:VerifyOnly) {
+        Write-Host 'If the workspace name is not found, create it:'
+        if (-not [string]::IsNullOrWhiteSpace($Script:Capacity)) {
+          Write-DryRun @('fabio', 'workspace', 'create', '--name', $Script:Workspace, '--capacity-id', $Script:Capacity, '--query', 'id', '--output', 'plain')
+        } else {
+          Write-DryRun @('fabio', 'workspace', 'create', '--name', $Script:Workspace, '--query', 'id', '--output', 'plain')
+        }
+      }
     }
     $Script:WorkspaceId = '<workspace-id>'
     return
   }
 
-  $resolved = Invoke-Fabio -Arguments @('workspace', 'show', '--id', $Script:Workspace, '--query', 'id', '--output', 'plain') -Capture -AllowFailure
-  if (-not [string]::IsNullOrWhiteSpace($resolved) -and $resolved -ne 'null') {
-    $Script:WorkspaceId = ($resolved -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1).Trim()
+  if ($isWorkspaceId) {
+    $resolved = Invoke-Fabio -Arguments @('workspace', 'show', '--id', $Script:Workspace, '--query', 'id', '--output', 'plain') -Capture
+    if ([string]::IsNullOrWhiteSpace($resolved) -or $resolved -eq 'null') {
+      Fail 'fabio workspace show did not return a workspace id. No workspace will be created.'
+    }
+    $Script:WorkspaceId = Get-FirstNonEmptyLine $resolved
     Write-Host "Resolved workspace id: $($Script:WorkspaceId)"
     return
   }
 
   $query = "[?displayName=='$($Script:Workspace)'].id | [0]"
   $resolved = Invoke-Fabio -Arguments @('workspace', 'list', '--all', '--query', $query, '--output', 'plain') -Capture
-  $resolved = ($resolved -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1).Trim()
+  $resolved = Get-FirstNonEmptyLine $resolved
   if (-not [string]::IsNullOrWhiteSpace($resolved) -and $resolved -ne 'null') {
     $Script:WorkspaceId = $resolved
     Write-Host "Resolved workspace '$($Script:Workspace)' to id: $($Script:WorkspaceId)"
     return
+  }
+
+  if ($Script:VerifyOnly) {
+    Fail 'Verify-only mode requires an existing workspace. Check the Fabio account, tenant, workspace name and workspace role.'
   }
 
   Write-Host "Workspace '$($Script:Workspace)' was not found; creating it."
@@ -506,11 +531,15 @@ function Resolve-Workspace {
   }
   $args += @('--query', 'id', '--output', 'plain')
   $created = Invoke-Fabio -Arguments $args -Capture
-  $Script:WorkspaceId = ($created -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1).Trim()
+  $Script:WorkspaceId = Get-FirstNonEmptyLine $created
   if ([string]::IsNullOrWhiteSpace($Script:WorkspaceId) -or $Script:WorkspaceId -eq 'null') {
     Fail 'fabio workspace create did not return a workspace id.'
   }
   Write-Host "Created workspace id: $($Script:WorkspaceId)"
+}
+
+function Get-FirstNonEmptyLine([string]$Value) {
+  return [string]($Value -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | Select-Object -First 1)
 }
 
 function Resolve-OrCreateItem([string]$Type, [string]$Name, [string]$Group, [string]$ExtraFlag = '', [string]$ExtraValue = '') {
@@ -531,7 +560,7 @@ function Resolve-OrCreateItem([string]$Type, [string]$Name, [string]$Group, [str
   }
 
   $id = Invoke-Fabio -Arguments @('item', 'list', '--workspace', $Script:WorkspaceId, '--type', $Type, '--query', $query, '--output', 'plain') -Capture
-  $id = ($id -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1).Trim()
+  $id = Get-FirstNonEmptyLine $id
   if (-not [string]::IsNullOrWhiteSpace($id) -and $id -ne 'null') {
     Write-Host "Resolved $Type '$Name': $id"
     return $id
@@ -548,7 +577,7 @@ function Resolve-OrCreateItem([string]$Type, [string]$Name, [string]$Group, [str
   }
   $create += @('--query', 'id', '--output', 'plain')
   $created = Invoke-Fabio -Arguments $create -Capture
-  $created = ($created -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1).Trim()
+  $created = Get-FirstNonEmptyLine $created
   if ([string]::IsNullOrWhiteSpace($created) -or $created -eq 'null') {
     Fail "fabio $Group create did not return an id for '$Name'."
   }

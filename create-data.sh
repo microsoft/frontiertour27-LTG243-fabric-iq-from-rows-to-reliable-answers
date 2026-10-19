@@ -433,6 +433,7 @@ check_prerequisites() {
   local node_version
   local node_major
   local fabio_version
+  local required_fabio_version
 
   command -v node >/dev/null 2>&1 || fail "node is required. Install Node.js 24 or later and retry."
   node_version="$(node --version)"
@@ -446,8 +447,14 @@ check_prerequisites() {
     fail "Node.js 24 or later is required; found $node_version."
   fi
 
-  command -v fabio >/dev/null 2>&1 || fail "fabio is required. Install fabio 0.70.0+ (0.71.0+ for Cosmos DB documents) and ensure it is on PATH."
+  [ -f "$ROOT_DIR/.fabio-version" ] || fail ".fabio-version is missing; restore the repository version pin."
+  required_fabio_version="$(tr -d '\r\n' < "$ROOT_DIR/.fabio-version")"
+  [[ "$required_fabio_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail ".fabio-version must contain a release version such as 0.79.0."
+  command -v fabio >/dev/null 2>&1 || fail "fabio is required. Install the pinned version $required_fabio_version and ensure it is on PATH."
   fabio_version="$(fabio --version)"
+  if [ "$fabio_version" != "fabio $required_fabio_version" ]; then
+    fail "Fabio $required_fabio_version is required by .fabio-version; found $fabio_version. Run: fabio upgrade --target-version $required_fabio_version"
+  fi
 
   info "node: $node_version"
   info "fabio: $fabio_version"
@@ -503,44 +510,67 @@ authenticate() {
   fi
 
   if ! fabio auth status >/dev/null 2>&1; then
-    printf 'ERROR: fabio is not authenticated. Run this command, then retry:\n  fabio auth login\n' >&2
+    printf 'ERROR: fabio is not authenticated. Complete the tenant-specific Azure CLI sign-in and fabio auth login in instructions/README.md, then retry. Native --browser login requires a customer-owned public-client ID.\n' >&2
     exit 1
   fi
+}
+
+first_nonempty_line() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' | sed -n '1p'
 }
 
 resolve_workspace() {
   local resolved
   local query
+  local is_workspace_id=0
+
+  if [[ "$WORKSPACE" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+    is_workspace_id=1
+  fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    print_dry_run fabio workspace show --id "$WORKSPACE" --query id --output plain
-    query="[?displayName=='$WORKSPACE'].id | [0]"
-    print_dry_run fabio workspace list --all --query "$query" --output plain
-    if [ -n "$CAPACITY" ]; then
-      print_dry_run fabio workspace create --name "$WORKSPACE" --capacity-id "$CAPACITY" --query id --output plain
+    if [ "$is_workspace_id" -eq 1 ]; then
+      print_dry_run fabio workspace show --id "$WORKSPACE" --query id --output plain
     else
-      print_dry_run fabio workspace create --name "$WORKSPACE" --query id --output plain
+      query="[?displayName=='$WORKSPACE'].id | [0]"
+      print_dry_run fabio workspace list --all --query "$query" --output plain
+      if [ "$VERIFY_ONLY" -eq 0 ]; then
+        info "If the workspace name is not found, create it:"
+        if [ -n "$CAPACITY" ]; then
+          print_dry_run fabio workspace create --name "$WORKSPACE" --capacity-id "$CAPACITY" --query id --output plain
+        else
+          print_dry_run fabio workspace create --name "$WORKSPACE" --query id --output plain
+        fi
+      fi
     fi
     WORKSPACE_ID="<workspace-id>"
     return 0
   fi
 
-  if resolved="$(fabio workspace show --id "$WORKSPACE" --query id --output plain 2>/dev/null)"; then
-    resolved="$(printf '%s' "$resolved" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  if [ "$is_workspace_id" -eq 1 ]; then
+    if ! resolved="$(fabio workspace show --id "$WORKSPACE" --query id --output plain)"; then
+      fail "Workspace ID lookup failed. Check the Fabio account, tenant, workspace ID and workspace role. No workspace will be created."
+    fi
+    resolved="$(printf '%s' "$resolved" | first_nonempty_line)"
     if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
       WORKSPACE_ID="$resolved"
       info "Resolved workspace id: $WORKSPACE_ID"
       return 0
     fi
+    fail "fabio workspace show did not return a workspace id. No workspace will be created."
   fi
 
   query="[?displayName=='$WORKSPACE'].id | [0]"
   resolved="$(fabio workspace list --all --query "$query" --output plain)"
-  resolved="$(printf '%s' "$resolved" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  resolved="$(printf '%s' "$resolved" | first_nonempty_line)"
   if [ -n "$resolved" ] && [ "$resolved" != "null" ]; then
     WORKSPACE_ID="$resolved"
     info "Resolved workspace '$WORKSPACE' to id: $WORKSPACE_ID"
     return 0
+  fi
+
+  if [ "$VERIFY_ONLY" -eq 1 ]; then
+    fail "Verify-only mode requires an existing workspace. Check the Fabio account, tenant, workspace name and workspace role."
   fi
 
   info "Workspace '$WORKSPACE' was not found; creating it."
@@ -549,7 +579,7 @@ resolve_workspace() {
   else
     WORKSPACE_ID="$(fabio workspace create --name "$WORKSPACE" --query id --output plain)"
   fi
-  WORKSPACE_ID="$(printf '%s' "$WORKSPACE_ID" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  WORKSPACE_ID="$(printf '%s' "$WORKSPACE_ID" | first_nonempty_line)"
   [ -n "$WORKSPACE_ID" ] && [ "$WORKSPACE_ID" != "null" ] || fail "fabio workspace create did not return a workspace id."
   info "Created workspace id: $WORKSPACE_ID"
 }
@@ -580,7 +610,7 @@ resolve_or_create_item() {
   fi
 
   id="$(fabio item list --workspace "$WORKSPACE_ID" --type "$type" --query "$query" --output plain)"
-  id="$(printf '%s' "$id" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  id="$(printf '%s' "$id" | first_nonempty_line)"
   if [ -n "$id" ] && [ "$id" != "null" ]; then
     info "Resolved $type '$name': $id" >&2
     printf '%s' "$id"
@@ -597,7 +627,7 @@ resolve_or_create_item() {
   else
     id="$(fabio "$group" create --workspace "$WORKSPACE_ID" --name "$name" --query id --output plain)"
   fi
-  id="$(printf '%s' "$id" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  id="$(printf '%s' "$id" | first_nonempty_line)"
   [ -n "$id" ] && [ "$id" != "null" ] || fail "fabio $group create did not return an id for '$name'."
   printf '%s' "$id"
 }

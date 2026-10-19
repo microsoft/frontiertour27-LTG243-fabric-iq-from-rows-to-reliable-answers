@@ -25,25 +25,48 @@ The demo is Fabric-only. It does not require an Azure subscription, Azure SQL
 logical server, Azure OpenAI deployment, or a separate application host.
 
 1. Install Node.js 24 or later, Bash or PowerShell 7, and
-   [Fabio CLI](https://github.com/iemejia/fabio) 0.71.0 or later.
+   [Fabio CLI](https://github.com/iemejia/fabio) **0.79.0**, pinned in
+   [`.fabio-version`](.fabio-version). If Fabio is already installed, run
+   `fabio upgrade --target-version 0.79.0`. Both deployment scripts require this
+   exact version for reproducible setup. For a fresh installation, follow the
+   [installation steps](instructions/README.md#0-install-the-pinned-fabio-version).
+   Install [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli)
+   for Fabio's default local sign-in; no Azure subscription is required.
 2. Use a Microsoft Fabric tenant with capacity and an empty or disposable
    workspace where you can create and load the required item types.
-3. Authenticate and review a dry run:
+3. From the repository root, validate locally and review a dry run (Bash):
 
    ```sh
-   fabio auth login --browser
-   ./create-data.sh --workspace <workspace-id> --dry-run
+   node data/tools/manifest.ts --check
+   node data/tools/validate.ts
+   read -r -p "Fabric workspace ID: " workspace_id
+   ./create-data.sh --workspace "$workspace_id" --dry-run
    ```
 
-4. Deploy and verify:
+4. Sign in to the workspace's tenant and confirm access before deploying:
 
    ```sh
-   ./create-data.sh --workspace <workspace-id>
-   ./create-data.sh --workspace <workspace-id> --verify-only --evaluate-agent
+   read -r -p "Fabric tenant ID or domain: " fabric_tenant
+   az login --tenant "$fabric_tenant" --allow-no-subscriptions
+   fabio auth login --tenant "$fabric_tenant"
+   fabio auth status
+   fabio workspace show --id "$workspace_id" -o table
+   ```
+
+   Stop if the workspace lookup fails. VS Code sign-in or Azure subscription
+   access alone does not establish Fabio access to this workspace. Fabio 0.79.0
+   native `--browser` login requires a customer-owned public-client application;
+   it is not the default setup path.
+
+5. After reviewing the dry run and confirming the workspace, deploy and verify:
+
+   ```sh
+   ./create-data.sh --workspace "$workspace_id"
+   ./create-data.sh --workspace "$workspace_id" --verify-only --evaluate-agent
    ```
 
 PowerShell presenters can use `pwsh ./create-data.ps1` with the same options.
-For the complete walkthrough, see the
+For copy-pasteable PowerShell commands and the complete walkthrough, see the
 [setup and demo guide](instructions/README.md).
 
 ## What the deployment creates
