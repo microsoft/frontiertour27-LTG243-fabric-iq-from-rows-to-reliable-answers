@@ -4,7 +4,8 @@ Read `AGENTS.md`, `README.md`, `instructions/README.md`, and
 `instructions/copilot.md` before helping with setup.
 
 - Scope is the Fabric-only LTG243 demo.
-- Use Node.js 24+ and Fabio 0.71.0+.
+- Use Node.js 24+ and the exact Fabio version pinned in `.fabio-version`
+  (0.79.0). Upgrade with `fabio upgrade --target-version 0.79.0` if needed.
 - Run the manifest check and validator before any deployment work.
 - Ask for the target workspace ID; do not infer or reuse one from logs.
 - Run `create-data.sh` or `create-data.ps1` with `--dry-run` first.

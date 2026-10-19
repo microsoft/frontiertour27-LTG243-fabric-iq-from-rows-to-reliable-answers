@@ -271,7 +271,7 @@ This is the evidence that turns the Act 1 claim from asserted correlation into a
 | Requirement | Notes |
 | --- | --- |
 | Node.js 24 or later | Required because the tooling runs `.ts` files directly with native TypeScript type stripping. There is no build step and no TypeScript compiler is required. This checkout was verified with Node.js `v24.16.0`. |
-| `fabio` CLI | Required for deployment to Fabric. Use `fabio 0.71.0` or later so `--with-cosmos` can create containers and load Cosmos DB documents. |
+| `fabio` CLI | Required for deployment to Fabric. Both scripts require exactly `fabio 0.79.0`, pinned in [`.fabio-version`](../.fabio-version). Upgrade with `fabio upgrade --target-version 0.79.0` if needed. |
 | Microsoft Fabric workspace | Use an existing workspace ID or display name, or provide a capacity ID so the script can create a workspace when needed. |
 | Fabric permissions | The operator must be able to create/read Fabric items and load data into Lakehouse, Eventhouse/KQL database, Fabric SQL Database, semantic model, ontology, and data agent items. `--with-cosmos` also requires permission and tenant availability to create a Fabric-native Cosmos DB database item, containers, and documents. |
 | PowerShell 7+ | Required only for the PowerShell deployment entry point. |
