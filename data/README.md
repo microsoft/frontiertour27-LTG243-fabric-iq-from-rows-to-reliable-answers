@@ -395,6 +395,7 @@ Common deployment options for both scripts:
 | `--capacity <value>` | Fabric capacity ID used only if the script creates a workspace. Defaults to `FABIO_CAPACITY`. |
 | `--prefix <value>` | Item name prefix. Defaults to `Caldova`, creating `CaldovaAnalytics`, `CaldovaSignals`, `CaldovaOperations`, `CaldovaDecisionMemory`, `CaldovaBusinessMeaning`, `CaldovaLaunchModel`, and `CaldovaAnalyst`. |
 | `--staging <dir>` | Uncompressed staging directory. Defaults to `data/.staging`. |
+| `--sql-load-mode <value>` | `cli` (default) uses bounded client imports; `notebook` stages SQL CSVs in OneLake and runs a Fabric Spark bulk loader against the same SQL tables. |
 | `--dry-run` | Runs local preparation and prints planned `fabio` commands without remote calls. |
 | `--skip-generate` | Uses committed files as-is. This is the default. |
 | `--regenerate` | Runs `node data/tools/generate.ts` before manifest checking, validation, expansion, and deployment. |
@@ -416,6 +417,14 @@ pwsh ./create-data.ps1 --workspace <id-or-name> --dry-run
 ```
 
 Both dry-run entry points exit 0 and print the same deployment plan and summary.
+
+To preview the alternative SQL path, add `--sql-load-mode notebook` to either
+dry-run command, and retain it on the separately approved deployment command.
+This creates an additional helper notebook and retains its staged source files
+and run history. It needs active Spark-capable capacity and notebook/SQL
+permissions. See [SQL load paths](../instructions/README.md#choose-the-sql-load-path)
+for the prerequisites and partial-failure recovery rules. Neither SQL path
+automatically resumes or retries a failed table import.
 
 Cosmos opt-in dry-run:
 

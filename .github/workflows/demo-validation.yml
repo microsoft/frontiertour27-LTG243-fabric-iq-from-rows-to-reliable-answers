@@ -23,3 +23,5 @@ jobs:
         run: node data/tools/manifest.ts --check
       - name: Validate data and Fabric contracts
         run: node data/tools/validate.ts
+      - name: Test deployment paths offline
+        run: node --test tests/deployment.test.mjs tests/import-sql.test.mjs tests/sql-notebook.test.mjs

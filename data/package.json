@@ -9,7 +9,7 @@
   },
   "scripts": {
     "build": "node tools/build-ontology.ts && node tools/build-semantic-model.ts",
-    "test": "node tools/manifest.ts --check && node tools/validate.ts && node --test ../tests/deployment.test.mjs",
+    "test": "node tools/manifest.ts --check && node tools/validate.ts && node --test ../tests/deployment.test.mjs ../tests/import-sql.test.mjs ../tests/sql-notebook.test.mjs",
     "generate": "node tools/generate.ts",
     "validate": "node tools/validate.ts",
     "manifest": "node tools/manifest.ts",

@@ -11,6 +11,7 @@
 #                        Defaults to FABIO_CAPACITY.
 #   --prefix <value>     Item name prefix. Defaults to Caldova.
 #   --staging <dir>      Uncompressed staging directory. Defaults to data/.staging.
+#   --sql-load-mode <value> SQL loading: cli (default) or notebook (OneLake + Spark).
 #   --dry-run            Validate locally and print fabio commands without remote calls.
 #   --skip-generate      Use committed files as-is. This is the default.
 #   --regenerate         Regenerate local payload files before validation.
@@ -37,6 +38,7 @@ WORKSPACE="${FABIO_WORKSPACE:-}"
 CAPACITY="${FABIO_CAPACITY:-}"
 PREFIX="Caldova"
 STAGING_INPUT="data/.staging"
+SQL_LOAD_MODE="cli"
 DRY_RUN=0
 REGENERATE=0
 OVERWRITE=0
@@ -372,6 +374,10 @@ while [ "$#" -gt 0 ]; do
       STAGING_INPUT="$(next_arg "$@")"
       shift 2
       ;;
+    --sql-load-mode)
+      SQL_LOAD_MODE="$(next_arg "$@")"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
@@ -417,6 +423,10 @@ done
 STAGING="$(absolute_path "$STAGING_INPUT")"
 
 [ -n "$WORKSPACE" ] || fail "--workspace or FABIO_WORKSPACE is required."
+case "$SQL_LOAD_MODE" in
+  cli|notebook) ;;
+  *) fail "--sql-load-mode must be cli or notebook." ;;
+esac
 ensure_query_safe "$WORKSPACE" "Workspace"
 ensure_query_safe "$PREFIX" "Prefix"
 
@@ -706,7 +716,7 @@ lakehouse_table_exists() {
   local query
   local result
   query="[?name=='$table' || displayName=='$table'].name | [0]"
-  result="$(run_fabio_capture lakehouse list-tables --workspace "$WORKSPACE_ID" --id "$LAKEHOUSE_ID" --query "$query" --output plain | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  result="$(run_fabio_capture lakehouse list-tables --workspace "$WORKSPACE_ID" --id "$LAKEHOUSE_ID" --all --query "$query" --output plain | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
   [ -n "$result" ] && [ "$result" != "null" ]
 }
 
@@ -801,7 +811,10 @@ apply_sql_script() {
   for batch in "$batch_dir"/batch_*.sql; do
     [ -f "$batch" ] || continue
     if grep -qE '[^[:space:]]' "$batch"; then
-      run_fabio sql-database query --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --sql "@$batch"
+      if ! run_fabio sql-database query --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --sql "@$batch"; then
+        rm -rf "$batch_dir"
+        fail "SQL script $(basename "$script"), batch $(basename "$batch") failed before SQL overwrite clearing/import. Earlier batches may have committed. No retry was attempted."
+      fi
       count=$((count + 1))
     fi
   done
@@ -840,14 +853,28 @@ load_fabric_sql() {
 
   truncate_sql_tables_for_overwrite
 
+  if [ "$SQL_LOAD_MODE" = "notebook" ]; then
+    local notebook_args=("$DATA_DIR/tools/import-sql-notebook.ts" --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --lakehouse "$LAKEHOUSE_ID" --directory "$dir" --name "${PREFIX}SqlLoad")
+    if [ "$DRY_RUN" -eq 1 ]; then
+      notebook_args+=(--dry-run)
+    fi
+    node "${notebook_args[@]}"
+  fi
+
   while IFS= read -r csv; do
     [ -n "$csv" ] || continue
     table="$(basename "$csv" .csv)"
     if ! is_identifier "$table"; then
       fail "Unsafe SQL table name derived from file $(basename "$csv"): $table"
     fi
-    rows="$(csv_row_count "$csv")"
-    run_fabio sql-database import --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --file "$csv" --table "$table" --no-create-table
+    rows="$(node "$DATA_DIR/tools/import-sql.ts" --file "$csv" --count-only)"
+    if [ "$SQL_LOAD_MODE" = "cli" ]; then
+      if [ "$DRY_RUN" -eq 1 ]; then
+        node "$DATA_DIR/tools/import-sql.ts" --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --file "$csv" --table "$table" --dry-run
+      else
+        node "$DATA_DIR/tools/import-sql.ts" --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --file "$csv" --table "$table"
+      fi
+    fi
     SQL_ROWS_LOADED="$((SQL_ROWS_LOADED + rows))"
   done < <(find "$dir" -maxdepth 1 -type f -name '*.csv' -print | sort)
 
@@ -1151,6 +1178,10 @@ resolve_existing_optional_item() {
 
   if [ "$DRY_RUN" -eq 1 ]; then
     print_dry_run fabio item list --workspace "$WORKSPACE_ID" --type "$type" --query "$query" --output plain >&2
+    if [ "$VERIFY_ONLY" -eq 1 ]; then
+      printf '<%s-id>' "$type"
+      return 0
+    fi
     return 1
   fi
 
@@ -1160,7 +1191,7 @@ resolve_existing_optional_item() {
     return 2
   fi
 
-  id="$(printf '%s' "$output" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
+  id="$(printf '%s' "$output" | first_nonempty_line)"
   if [ -n "$id" ] && [ "$id" != "null" ]; then
     printf '%s' "$id"
     return 0
@@ -1224,6 +1255,7 @@ console.log(objectCount(payload.entities) + '\t' + objectCount(payload.relations
 prepare_ontology_bindings() {
   local cluster_uri
   local output
+  local lakehouse_schema
 
   info "Checking ontology definition compatibility..."
   print_node_dry_run "$DATA_DIR/tools/build-ontology.ts" --check
@@ -1238,9 +1270,17 @@ prepare_ontology_bindings() {
     return 1
   fi
 
+  if ! output="$(run_fabio_optional_capture lakehouse show --workspace "$WORKSPACE_ID" --id "$LAKEHOUSE_ID" --query properties.defaultSchema --output plain)"; then
+    warn "Could not discover the Lakehouse schema for ontology bindings: $output"
+    FABRIC_ITEM_WARNINGS=1
+    return 1
+  fi
+  lakehouse_schema="$(printf '%s' "$output" | first_nonempty_line)"
+  [ "$lakehouse_schema" != "null" ] || lakehouse_schema=""
+
   info "Generating ontology binding map."
-  print_node_dry_run "$DATA_DIR/tools/build-ontology.ts" --bindings-output "$ONTOLOGY_BINDINGS_OUTPUT" --eventhouse "$EVENTHOUSE_ID" --cluster-uri "$cluster_uri" --database "$KQL_DATABASE_NAME"
-  if output="$(node "$DATA_DIR/tools/build-ontology.ts" --bindings-output "$ONTOLOGY_BINDINGS_OUTPUT" --eventhouse "$EVENTHOUSE_ID" --cluster-uri "$cluster_uri" --database "$KQL_DATABASE_NAME" 2>&1)"; then
+  print_node_dry_run "$DATA_DIR/tools/build-ontology.ts" --bindings-output "$ONTOLOGY_BINDINGS_OUTPUT" --eventhouse "$EVENTHOUSE_ID" --cluster-uri "$cluster_uri" --database "$KQL_DATABASE_NAME" "--lakehouse-schema=$lakehouse_schema"
+  if output="$(node "$DATA_DIR/tools/build-ontology.ts" --bindings-output "$ONTOLOGY_BINDINGS_OUTPUT" --eventhouse "$EVENTHOUSE_ID" --cluster-uri "$cluster_uri" --database "$KQL_DATABASE_NAME" "--lakehouse-schema=$lakehouse_schema" 2>&1)"; then
     printf '%s\n' "$output"
     record_ontology_binding_counts "$ONTOLOGY_BINDINGS_OUTPUT"
     return 0
@@ -1477,6 +1517,29 @@ deploy_semantic_model() {
   fi
 }
 
+ontology_search_when_ready() {
+  local prompt="$1"
+  local output
+  local attempt
+  for ((attempt = 1; attempt <= 40; attempt++)); do
+    if output="$(run_fabio_optional_capture ontology search --workspace "$WORKSPACE_ID" --id "$ONTOLOGY_ID" --prompt "$prompt" --output plain)"; then
+      printf '%s' "$output"
+      return 0
+    fi
+    case "$output" in
+      *"Graph Model is not ready"*)
+        if [ "$attempt" -lt 40 ]; then
+          warn "Ontology graph is still materializing (check $attempt/40); waiting 30 seconds without reloading data."
+          sleep 30
+          continue
+        fi
+        ;;
+    esac
+    printf '%s' "$output"
+    return 1
+  done
+}
+
 verify_ontology_peer_surface() {
   local output
   local url
@@ -1516,7 +1579,7 @@ verify_ontology_peer_surface() {
     FABRIC_ITEM_WARNINGS=1
   fi
 
-  if output="$(run_fabio_optional_capture ontology search --workspace "$WORKSPACE_ID" --id "$ONTOLOGY_ID" --prompt "$prompt" --output plain)"; then
+  if output="$(ontology_search_when_ready "$prompt")"; then
     if [ "$DRY_RUN" -eq 1 ]; then
       ONTOLOGY_SEARCH_STATUS="dry-run"
     elif [ -n "$(printf '%s' "$output" | tr -d '\r' | sed '/^$/d' | sed -n '1p')" ]; then
@@ -1844,7 +1907,9 @@ verify_data_agent_act1_answer() {
   local question
   local output
 
-  [ "$DATA_AGENT_PUBLISHED" = "yes" ] || return 0
+  if [ "$DATA_AGENT_PUBLISHED" != "yes" ] && { [ "$VERIFY_ONLY" -ne 1 ] || [ -z "$DATA_AGENT_ID" ]; }; then
+    return 0
+  fi
   if ! question="$(data_agent_act1_question 2>/dev/null)"; then
     warn "Could not read the Act 1 evaluation question; data agent query verification was skipped."
     DATA_AGENT_EL_NINO_SIGNAL_STATUS="skipped"
@@ -1857,6 +1922,7 @@ verify_data_agent_act1_answer() {
       DATA_AGENT_EL_NINO_SIGNAL_STATUS="dry-run"
       return 0
     fi
+    DATA_AGENT_PUBLISHED="yes"
     if printf '%s' "$output" | grep -Eiq 'El[[:space:]-]*Nino|ENSO|SIG-ENSO'; then
       info "PASS: Data agent Act 1 answer mentioned the El Nino signal."
       DATA_AGENT_EL_NINO_SIGNAL_STATUS="mentioned"
@@ -1933,7 +1999,7 @@ evaluate_data_agent() {
   local output
 
   [ "$EVALUATE_AGENT" -eq 1 ] || return 0
-  if [ "$DATA_AGENT_PUBLISHED" != "yes" ] || [ -z "$DATA_AGENT_ID" ]; then
+  if [ -z "$DATA_AGENT_ID" ] || { [ "$DATA_AGENT_PUBLISHED" != "yes" ] && [ "$VERIFY_ONLY" -ne 1 ]; }; then
     warn "Data agent evaluation was requested but no published agent is available."
     DATA_AGENT_EVALUATION_STATUS="skipped"
     FABRIC_ITEM_WARNINGS=1
@@ -2140,6 +2206,13 @@ deploy_data_agent() {
       continue
     fi
 
+    if [ -n "$instructions" ]; then
+      if ! output="$(run_fabio_optional_capture data-agent update-datasource --workspace "$WORKSPACE_ID" --id "$DATA_AGENT_ID" --datasource "$source_ref" --instructions "$instructions")"; then
+        warn "Data agent instructions for source '$key' were not applied: $output"
+        FABRIC_ITEM_WARNINGS=1
+      fi
+    fi
+
     if data_agent_fewshots_uploadable "$fewshots_uploadable"; then
       if [ -z "$fewshot" ]; then
         warn "Data agent source '$key' is marked fewShotsUploadable=true but has no fewShotFile."
@@ -2300,12 +2373,25 @@ verify_lakehouse_dashboard_tables() {
   local dashboard="$STAGING/lakehouse/dashboard"
   local csv
   local table
+  local attempt
+  local found
   [ -d "$dashboard" ] || return 0
   while IFS= read -r csv; do
     [ -n "$csv" ] || continue
     table="dash_$(to_snake_table_name "$(basename "$csv" .csv)")"
     is_identifier "$table" || continue
-    if lakehouse_table_exists "$table"; then
+    found=0
+    for attempt in 1 2 3 4 5 6; do
+      if lakehouse_table_exists "$table"; then
+        found=1
+        break
+      fi
+      if [ "$attempt" -lt 6 ]; then
+        warn "Waiting for Lakehouse metadata for $table (check $attempt/6); no data will be reloaded."
+        sleep 5
+      fi
+    done
+    if [ "$found" -eq 1 ]; then
       printf 'PASS: Lakehouse table %s exists\n' "$table"
     else
       printf 'FAIL: Lakehouse table %s was not found\n' "$table" >&2
@@ -2359,22 +2445,61 @@ verify_semantic_model_query() {
   # the Lakehouse correctly reported none, which would contradict the
   # open-decision story the session depends on. Compare a table both surfaces
   # hold and fail loudly if they disagree.
-  local model_rows lake_rows
+  local model_rows lake_rows expected_rows
+  if [ ! -f "$STAGING/fabric-sql/capacity_plan.csv" ]; then
+    warn "Semantic model framing check is missing the staged capacity_plan fixture."
+    FABRIC_ITEM_WARNINGS=1
+    return 0
+  fi
+  expected_rows="$(csv_row_count "$STAGING/fabric-sql/capacity_plan.csv")"
   if model_rows="$(run_fabio_optional_capture semantic-model query --workspace "$WORKSPACE_ID" --id "$SEMANTIC_MODEL_ID" --dax 'EVALUATE ROW("n", COUNTROWS(capacity_plan))' --query '[0]."[n]"' --output plain)" &&
     lake_rows="$(run_fabio_optional_capture lakehouse query --workspace "$WORKSPACE_ID" --id "$LAKEHOUSE_ID" --sql 'SELECT COUNT(*) AS n FROM capacity_plan' --query '[0].n' --output plain)"; then
     model_rows="$(printf '%s' "$model_rows" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
     lake_rows="$(printf '%s' "$lake_rows" | tr -d '\r' | sed '/^$/d' | sed -n '1p')"
-    if [ -n "$model_rows" ] && [ "$model_rows" = "$lake_rows" ]; then
+    if [ "$model_rows" = "$expected_rows" ] && [ "$lake_rows" = "$expected_rows" ]; then
       printf 'PASS: Semantic model agrees with the Lakehouse (capacity_plan = %s rows)\n' "$model_rows"
     else
-      warn "Semantic model is stale: capacity_plan reports $model_rows rows but the Lakehouse reports $lake_rows. Re-run 'fabio semantic-model refresh --type full'."
+      warn "Semantic model/Lakehouse capacity_plan row counts do not match the fixture: model=$model_rows, Lakehouse=$lake_rows, expected=$expected_rows. Check the load and model framing before refreshing."
       FABRIC_ITEM_WARNINGS=1
     fi
+  else
+    warn "Semantic model framing comparison could not read both row counts."
+    FABRIC_ITEM_WARNINGS=1
+  fi
+}
+
+resolve_verification_items() {
+  if ONTOLOGY_ID="$(resolve_existing_optional_item Ontology "$ONTOLOGY_NAME")"; then
+    ONTOLOGY_STATUS="resolved"
+  else
+    ONTOLOGY_STATUS="failed"
+    warn "Verification could not resolve ontology '$ONTOLOGY_NAME'; no item will be created."
+    FABRIC_ITEM_WARNINGS=1
+  fi
+  if SEMANTIC_MODEL_ID="$(resolve_existing_optional_item SemanticModel "$SEMANTIC_MODEL_NAME")"; then
+    SEMANTIC_MODEL_STATUS="resolved"
+  else
+    SEMANTIC_MODEL_STATUS="failed"
+    warn "Verification could not resolve semantic model '$SEMANTIC_MODEL_NAME'; no item will be created."
+    FABRIC_ITEM_WARNINGS=1
+  fi
+  if DATA_AGENT_ID="$(resolve_existing_optional_item DataAgent "$DATA_AGENT_NAME")"; then
+    DATA_AGENT_STATUS="resolved"
+    DATA_AGENT_PUBLISHED="unverified"
+  else
+    DATA_AGENT_STATUS="failed"
+    warn "Verification could not resolve data agent '$DATA_AGENT_NAME'; no item will be created."
+    FABRIC_ITEM_WARNINGS=1
   fi
 }
 
 run_verification() {
   info "Running post-load verification..."
+  if [ "$VERIFY_ONLY" -eq 1 ] && [ "$SKIP_FABRIC_ITEMS" -eq 0 ]; then
+    verify_ontology_peer_surface
+    verify_data_agent_act1_answer
+    evaluate_data_agent
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then
     print_dry_run fabio sql-database query --workspace "$WORKSPACE_ID" --id "$SQL_DATABASE_ID" --sql "SELECT COUNT_BIG(*) AS value FROM dbo.<table>;" --query '[0].value' --output plain
     print_dry_run fabio kql-database query --workspace "$WORKSPACE_ID" --id "$KQL_DATABASE_ID" --kql "LineSignals | summarize value=count()" --query '[0].value' --output plain
@@ -2398,6 +2523,7 @@ run_verification() {
 print_summary() {
   info ""
   info "Deployment summary"
+  info "  SQL load mode: $SQL_LOAD_MODE"
   info "  Workspace: $WORKSPACE_ID"
   info "  Lakehouse: $LAKEHOUSE_NAME ($LAKEHOUSE_ID)"
   info "  Eventhouse: $EVENTHOUSE_NAME ($EVENTHOUSE_ID)"
@@ -2414,7 +2540,7 @@ print_summary() {
   info "  Ontology MCP endpoint: ${ONTOLOGY_MCP_URL:-<none>} [mcp-url: $ONTOLOGY_MCP_URL_STATUS; search: $ONTOLOGY_SEARCH_STATUS]"
   info "  Semantic model: $SEMANTIC_MODEL_NAME (${SEMANTIC_MODEL_ID:-<none>}) [$SEMANTIC_MODEL_STATUS; refresh: $SEMANTIC_MODEL_REFRESH_STATUS]"
   info "  Semantic model connection: ${SEMANTIC_MODEL_CONNECTION_ID:-<none>} [$SEMANTIC_MODEL_CONNECTION_SOURCE]"
-  info "  Data agent: $DATA_AGENT_NAME (${DATA_AGENT_ID:-<none>}) [$DATA_AGENT_STATUS; sources attached: $DATA_AGENT_SOURCES_ATTACHED; published: $DATA_AGENT_PUBLISHED; few-shot verification: $DATA_AGENT_FEWSHOT_STATUS; few-shot sources verified: $DATA_AGENT_FEWSHOT_SOURCES_VERIFIED; El Nino signal: $DATA_AGENT_EL_NINO_SIGNAL_STATUS; evaluation: $DATA_AGENT_EVALUATION_STATUS]"
+  info "  Data agent: $DATA_AGENT_NAME (${DATA_AGENT_ID:-<none>}) [$DATA_AGENT_STATUS; source attachments this run: $DATA_AGENT_SOURCES_ATTACHED; published: $DATA_AGENT_PUBLISHED; few-shot verification: $DATA_AGENT_FEWSHOT_STATUS; few-shot sources verified: $DATA_AGENT_FEWSHOT_SOURCES_VERIFIED; El Nino signal: $DATA_AGENT_EL_NINO_SIGNAL_STATUS; evaluation: $DATA_AGENT_EVALUATION_STATUS]"
   info "  SQL rows loaded: $SQL_ROWS_LOADED"
   info "  Eventhouse rows loaded: $EVENTHOUSE_ROWS_LOADED"
   info "  Lakehouse files uploaded: $LAKEHOUSE_FILES_UPLOADED"
@@ -2467,6 +2593,8 @@ main() {
     ONTOLOGY_BINDING_STATUS="skipped"
     SEMANTIC_MODEL_STATUS="skipped"
     SEMANTIC_MODEL_REFRESH_STATUS="skipped"
+  else
+    resolve_verification_items
   fi
 
   run_verification
