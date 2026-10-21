@@ -19,10 +19,23 @@ All business records are synthetic and fictional.
 > agent using the [agent runbook](instructions/copilot.md). The complete manual
 > steps remain below.
 
-## Fastest setup
+**Delivering this session?** Start with the
+[speaker checklist](delivery-resources/README.md): it covers slides, the
+administrator handoff, the OneLake/notebook setup route, readiness checks, and
+the live walkthrough. The slide deck is distributed by the tour coordinator,
+not included in this repository.
+
+## Recommended setup: OneLake upload + Fabric notebook
 
 The demo is Fabric-only. It does not require an Azure subscription, Azure SQL
 logical server, Azure OpenAI deployment, or a separate application host.
+
+**Option 1 (recommended for speakers):** Upload the SQL CSV files to OneLake
+and let a helper Fabric Spark notebook load them into the Fabric SQL Database.
+The deployment script creates the notebook, runs it, waits for completion, and
+verifies the data; you do not need to edit or run notebook cells manually.
+This path needs Spark-capable capacity and permission to upload Lakehouse files,
+create/run notebooks, and write to the SQL Database.
 
 1. Install Node.js 24 or later, Bash or PowerShell 7, and
    [Fabio CLI](https://github.com/iemejia/fabio) **0.79.0**, pinned in
@@ -40,7 +53,7 @@ logical server, Azure OpenAI deployment, or a separate application host.
    node data/tools/manifest.ts --check
    node data/tools/validate.ts
    read -r -p "Fabric workspace ID: " workspace_id
-   ./create-data.sh --workspace "$workspace_id" --dry-run
+   ./create-data.sh --workspace "$workspace_id" --sql-load-mode notebook --dry-run
    ```
 
 4. Sign in to the workspace's tenant and confirm access before deploying:
@@ -61,13 +74,25 @@ logical server, Azure OpenAI deployment, or a separate application host.
 5. After reviewing the dry run and confirming the workspace, deploy and verify:
 
    ```sh
-   ./create-data.sh --workspace "$workspace_id"
+   ./create-data.sh --workspace "$workspace_id" --sql-load-mode notebook
    ./create-data.sh --workspace "$workspace_id" --verify-only --evaluate-agent
    ```
 
 PowerShell presenters can use `pwsh ./create-data.ps1` with the same options.
 For copy-pasteable PowerShell commands and the complete walkthrough, see the
 [setup and demo guide](instructions/README.md).
+
+### Option 2: Client-side CLI import
+
+If notebook execution is not suitable for your environment, select
+`--sql-load-mode cli` in both the dry-run and deployment commands above.
+This uses bounded imports from the local machine instead of a helper notebook.
+For backward compatibility, omitting `--sql-load-mode` still selects `cli`;
+the recommended commands explicitly select `notebook`.
+
+See [SQL load paths](instructions/README.md#choose-the-sql-load-path) for
+permissions and recovery guidance. Neither mode automatically resumes a
+partial load; do not switch modes to recover a failed import.
 
 ## What the deployment creates
 

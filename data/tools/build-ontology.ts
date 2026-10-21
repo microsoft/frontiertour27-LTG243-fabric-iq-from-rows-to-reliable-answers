@@ -28,6 +28,7 @@ type CliOptions = {
   eventhouseId?: string;
   clusterUri?: string;
   databaseName?: string;
+  lakehouseSchema?: string;
 };
 
 type DefinitionFile = {
@@ -54,24 +55,25 @@ type BindingValidation = {
 
 function usage(): string {
   return [
-    'Usage: node data/tools/build-ontology.ts [--check] [--bindings-output <path>] [--eventhouse <id>] [--cluster-uri <uri>] [--database <name>]',
+    'Usage: node data/tools/build-ontology.ts [--check] [--bindings-output <path>] [--eventhouse <id>] [--cluster-uri <uri>] [--database <name>] [--lakehouse-schema=<schema>]',
     '',
     'Normalizes Fabric ontology definitions and validates src/fabric/CaldovaLaunch.Ontology/bindings.json.',
     'With --bindings-output, writes a deploy-ready binding map with Eventhouse placeholders substituted.',
     'Omitted Eventhouse arguments leave __EVENTHOUSE_ID__, __KUSTO_CLUSTER_URI__, and __KQL_DATABASE__ placeholders in the output.',
+    'Use --lakehouse-schema= for a schema-less Lakehouse; otherwise pass its actual default schema.',
   ].join('\n');
 }
 
-function readOptionValue(args: string[], index: number, option: string): { value: string; nextIndex: number } {
+function readOptionValue(args: string[], index: number, option: string, allowEmpty = false): { value: string; nextIndex: number } {
   const arg = args[index];
   if (arg.startsWith(`${option}=`)) {
     const value = arg.slice(option.length + 1);
-    if (!value) throw new Error(`Missing value for ${option}`);
+    if (!value && !allowEmpty) throw new Error(`Missing value for ${option}`);
     return { value, nextIndex: index };
   }
 
   const value = args[index + 1];
-  if (!value || value.startsWith('--')) {
+  if (value === undefined || (!value && !allowEmpty) || value.startsWith('--')) {
     throw new Error(`Missing value for ${option}`);
   }
   return { value, nextIndex: index + 1 };
@@ -115,6 +117,12 @@ function parseArgs(): CliOptions {
     if (option === '--database') {
       const result = readOptionValue(args, index, option);
       options.databaseName = result.value;
+      index = result.nextIndex;
+      continue;
+    }
+    if (option === '--lakehouse-schema') {
+      const result = readOptionValue(args, index, option, true);
+      options.lakehouseSchema = result.value;
       index = result.nextIndex;
       continue;
     }
@@ -489,6 +497,12 @@ async function processBindingMap(options: CliOptions, entityDefinitions: Map<str
   const resolved = replacePlaceholders(parsed, replacements);
   if (!isJsonObject(resolved)) {
     throw new Error(`${relativeDisplay(bindingsPath)} did not resolve to a JSON object.`);
+  }
+  if (options.lakehouseSchema !== undefined) {
+    if (!isJsonObject(resolved.source) || resolved.source.type !== 'LakehouseTable') {
+      throw new Error('The default binding source must be LakehouseTable to override its schema.');
+    }
+    resolved.source.sourceSchema = options.lakehouseSchema;
   }
 
   const validation = validateBindingMap(resolved, entityDefinitions);

@@ -10,6 +10,7 @@ Deploys the shared Caldova LTG243 synthetic demo dataset into Microsoft Fabric u
 --capacity <value>   Fabric capacity id used only when creating a missing workspace. Defaults to FABIO_CAPACITY.
 --prefix <value>     Item name prefix. Defaults to Caldova.
 --staging <dir>      Uncompressed staging directory. Defaults to data/.staging.
+--sql-load-mode <value> SQL loading: cli (default) or notebook (OneLake + Spark).
 --dry-run            Validate locally and print fabio commands without remote calls.
 --skip-generate      Use committed files as-is. This is the default.
 --regenerate         Regenerate local payload files before validation.
@@ -39,6 +40,7 @@ $Script:Workspace = $env:FABIO_WORKSPACE
 $Script:Capacity = $env:FABIO_CAPACITY
 $Script:Prefix = 'Caldova'
 $Script:StagingInput = 'data/.staging'
+$Script:SqlLoadMode = 'cli'
 $Script:DryRun = $false
 $Script:Regenerate = $false
 $Script:Overwrite = $false
@@ -133,6 +135,10 @@ for ($i = 0; $i -lt $args.Count; $i++) {
       $Script:StagingInput = Get-RequiredValue $args $i $args[$i]
       $i++
     }
+    '--sql-load-mode' {
+      $Script:SqlLoadMode = Get-RequiredValue $args $i $args[$i]
+      $i++
+    }
     '--dry-run' {
       $Script:DryRun = $true
     }
@@ -173,6 +179,9 @@ for ($i = 0; $i -lt $args.Count; $i++) {
 
 if ([string]::IsNullOrWhiteSpace($Script:Workspace)) {
   Fail '--workspace or FABIO_WORKSPACE is required.'
+}
+if ($Script:SqlLoadMode -cnotin @('cli', 'notebook')) {
+  Fail '--sql-load-mode must be cli or notebook.'
 }
 
 function Get-AbsolutePath([string]$Path) {
@@ -660,7 +669,7 @@ function Invoke-KqlScalar([string]$Kql) {
 
 function Test-LakehouseTableExists([string]$Table) {
   $query = "[?name=='$Table' || displayName=='$Table'].name | [0]"
-  $result = Invoke-Fabio -Arguments @('lakehouse', 'list-tables', '--workspace', $Script:WorkspaceId, '--id', $Script:LakehouseId, '--query', $query, '--output', 'plain') -Capture
+  $result = Invoke-Fabio -Arguments @('lakehouse', 'list-tables', '--workspace', $Script:WorkspaceId, '--id', $Script:LakehouseId, '--all', '--query', $query, '--output', 'plain') -Capture
   if ($null -eq $result) { return $false }
   $value = ($result -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1)
   return (-not [string]::IsNullOrWhiteSpace($value) -and $value.Trim() -ne 'null')
@@ -736,7 +745,11 @@ function Invoke-SqlScript([string]$ScriptPath) {
       if ([string]::IsNullOrWhiteSpace($batch)) { continue }
       $batchPath = Join-Path $tempDir ("batch_{0:d3}.sql" -f $i)
       Set-Content -LiteralPath $batchPath -Value $batch -NoNewline
-      Invoke-Fabio -Arguments @('sql-database', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId, '--sql', "@$batchPath")
+      try {
+        Invoke-Fabio -Arguments @('sql-database', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId, '--sql', "@$batchPath")
+      } catch {
+        throw "SQL script $([System.IO.Path]::GetFileName($ScriptPath)), batch $i failed before SQL overwrite clearing/import. Earlier batches may have committed. No retry was attempted.`n$_"
+      }
       $count++
     }
   }
@@ -773,13 +786,31 @@ function Load-FabricSql {
 
   Clear-SqlTablesForOverwrite
 
+  if ($Script:SqlLoadMode -eq 'notebook') {
+    $notebookArgs = @(
+      (Join-Path $Script:DataDir 'tools/import-sql-notebook.ts'),
+      '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId,
+      '--lakehouse', $Script:LakehouseId, '--directory', $dir, '--name', "$($Script:Prefix)SqlLoad"
+    )
+    if ($Script:DryRun) { $notebookArgs += '--dry-run' }
+    Invoke-NodeRequiredVisible -Arguments $notebookArgs
+  }
+
   foreach ($csv in Get-ChildItem -LiteralPath $dir -Filter '*.csv' -File | Sort-Object FullName) {
     $table = [System.IO.Path]::GetFileNameWithoutExtension($csv.Name)
     if (-not (Test-Identifier $table)) {
       Fail "Unsafe SQL table name derived from file $($csv.Name): $table"
     }
-    $rows = Get-CsvRowCount $csv.FullName
-    Invoke-Fabio -Arguments @('sql-database', 'import', '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId, '--file', $csv.FullName, '--table', $table, '--no-create-table')
+    $importer = Join-Path $Script:DataDir 'tools/import-sql.ts'
+    $rows = & node $importer --file $csv.FullName --count-only
+    if ($LASTEXITCODE -ne 0) {
+      throw "SQL CSV record counting failed for $($csv.Name)."
+    }
+    if ($Script:SqlLoadMode -eq 'cli') {
+      $importArgs = @($importer, '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId, '--file', $csv.FullName, '--table', $table)
+      if ($Script:DryRun) { $importArgs += '--dry-run' }
+      Invoke-NodeRequiredVisible -Arguments $importArgs
+    }
     $Script:SqlRowsLoaded += $rows
   }
 
@@ -1035,6 +1066,7 @@ function Resolve-ExistingOptionalItem([string]$Type, [string]$Name) {
 
   if ($Script:DryRun) {
     Write-DryRun @('fabio', 'item', 'list', '--workspace', $Script:WorkspaceId, '--type', $Type, '--query', $query, '--output', 'plain')
+    if ($Script:VerifyOnly) { return "<$Type-id>" }
     return ''
   }
 
@@ -1139,13 +1171,24 @@ function New-OntologyBindings {
     return $false
   }
 
+  try {
+    $schemaOutput = Invoke-Fabio -Arguments @('lakehouse', 'show', '--workspace', $Script:WorkspaceId, '--id', $Script:LakehouseId, '--query', 'properties.defaultSchema', '--output', 'plain') -Capture
+    $lakehouseSchema = Get-FirstNonEmptyLine $schemaOutput
+    if ($lakehouseSchema -eq 'null') { $lakehouseSchema = '' }
+  } catch {
+    Warn "Could not discover the Lakehouse schema for ontology bindings: $($_.Exception.Message)"
+    $Script:FabricItemWarnings = $true
+    return $false
+  }
+
   Write-Host 'Generating ontology binding map.'
   $buildArgs = @(
     (Join-Path $Script:DataDir 'tools/build-ontology.ts'),
     '--bindings-output', $Script:OntologyBindingsOutput,
     '--eventhouse', $Script:EventhouseId,
     '--cluster-uri', $clusterUri,
-    '--database', $Script:KqlDatabaseName
+    '--database', $Script:KqlDatabaseName,
+    "--lakehouse-schema=$lakehouseSchema"
   )
   Write-NodeDryRun $buildArgs
   try {
@@ -1422,6 +1465,21 @@ function Deploy-SemanticModel {
   }
 }
 
+function Invoke-OntologySearchWhenReady([string]$Prompt) {
+  for ($attempt = 1; $attempt -le 40; $attempt++) {
+    try {
+      return Invoke-Fabio -Arguments @('ontology', 'search', '--workspace', $Script:WorkspaceId, '--id', $Script:OntologyId, '--prompt', $Prompt, '--output', 'plain') -Capture
+    } catch {
+      if ($_.Exception.Message -match 'Graph Model is not ready' -and $attempt -lt 40) {
+        Warn "Ontology graph is still materializing (check $attempt/40); waiting 30 seconds without reloading data."
+        Start-Sleep -Seconds 30
+        continue
+      }
+      throw
+    }
+  }
+}
+
 function Verify-OntologyPeerSurface {
   if ($Script:SkipFabricItems -or
       $Script:OntologyStatus -eq 'skipped' -or
@@ -1471,7 +1529,7 @@ function Verify-OntologyPeerSurface {
   if ([string]::IsNullOrWhiteSpace($signalId)) { $signalId = 'the persistent El Nino advisory' }
   $prompt = "Which regions are affected by the El Nino signal ${signalId}?"
   try {
-    $output = Invoke-Fabio -Arguments @('ontology', 'search', '--workspace', $Script:WorkspaceId, '--id', $Script:OntologyId, '--prompt', $prompt, '--output', 'plain') -Capture
+    $output = Invoke-OntologySearchWhenReady $prompt
     if ($Script:DryRun) {
       $Script:OntologySearchStatus = 'dry-run'
     }
@@ -1775,7 +1833,7 @@ function Verify-DataAgentFewshots([string]$Key, [string]$SourceRef) {
 }
 
 function Verify-DataAgentAct1Answer {
-  if ($Script:DataAgentPublished -ne 'yes') { return }
+  if ($Script:DataAgentPublished -ne 'yes' -and (-not $Script:VerifyOnly -or [string]::IsNullOrWhiteSpace($Script:DataAgentId))) { return }
   $question = Get-DataAgentAct1Question
   if ([string]::IsNullOrWhiteSpace($question)) {
     Warn 'Could not read the Act 1 evaluation question; data agent query verification was skipped.'
@@ -1790,6 +1848,7 @@ function Verify-DataAgentAct1Answer {
       $Script:DataAgentElNinoSignalStatus = 'dry-run'
       return
     }
+    $Script:DataAgentPublished = 'yes'
     if ($output -match '(?i)(El\s*-?\s*Nino|ENSO|SIG-ENSO)') {
       Write-Host 'PASS: Data agent Act 1 answer mentioned the El Nino signal.'
       $Script:DataAgentElNinoSignalStatus = 'mentioned'
@@ -1815,7 +1874,7 @@ function Verify-DataAgentAct1Answer {
 
 function Invoke-DataAgentEvaluation {
   if (-not $Script:EvaluateAgent) { return }
-  if ($Script:DataAgentPublished -ne 'yes' -or [string]::IsNullOrWhiteSpace($Script:DataAgentId)) {
+  if ([string]::IsNullOrWhiteSpace($Script:DataAgentId) -or ($Script:DataAgentPublished -ne 'yes' -and -not $Script:VerifyOnly)) {
     Warn 'Data agent evaluation was requested but no published agent is available.'
     $Script:DataAgentEvaluationStatus = 'skipped'
     $Script:FabricItemWarnings = $true
@@ -1989,6 +2048,15 @@ function Deploy-DataAgent {
       }
     }
 
+    if (-not [string]::IsNullOrWhiteSpace($source.instructions)) {
+      try {
+        $null = Invoke-Fabio -Arguments @('data-agent', 'update-datasource', '--workspace', $Script:WorkspaceId, '--id', $Script:DataAgentId, '--datasource', $sourceRef, '--instructions', [string]$source.instructions) -Capture
+      } catch {
+        Warn "Data agent instructions for source '$key' were not applied: $($_.Exception.Message)"
+        $Script:FabricItemWarnings = $true
+      }
+    }
+
     if (Test-DataAgentFewshotsUploadable ([string]$source.fewShotsUploadable)) {
       if ([string]::IsNullOrWhiteSpace($fewshot)) {
         Warn "Data agent source '$key' is marked fewShotsUploadable=true but has no fewShotFile."
@@ -2148,7 +2216,18 @@ function Verify-LakehouseDashboardTables {
   foreach ($csv in Get-ChildItem -LiteralPath $dashboard -Filter '*.csv' -File | Sort-Object FullName) {
     $table = 'dash_' + (ConvertTo-SnakeTableName ([System.IO.Path]::GetFileNameWithoutExtension($csv.Name)))
     if (-not (Test-Identifier $table)) { continue }
-    if (Test-LakehouseTableExists $table) {
+    $found = $false
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+      if (Test-LakehouseTableExists $table) {
+        $found = $true
+        break
+      }
+      if ($attempt -lt 6) {
+        Warn "Waiting for Lakehouse metadata for $table (check $attempt/6); no data will be reloaded."
+        Start-Sleep -Seconds 5
+      }
+    }
+    if ($found) {
       Write-Host "PASS: Lakehouse table $table exists"
     } else {
       [Console]::Error.WriteLine("FAIL: Lakehouse table $table was not found")
@@ -2199,23 +2278,64 @@ function Verify-SemanticModelQuery {
   # is not cosmetic here: it once reported three executed governed actions while
   # the Lakehouse correctly reported none, which would contradict the
   # open-decision story the session depends on.
+  $fixture = Join-Path $Script:Staging 'fabric-sql/capacity_plan.csv'
+  if (-not (Test-Path -LiteralPath $fixture -PathType Leaf)) {
+    Warn 'Semantic model framing check is missing the staged capacity_plan fixture.'
+    $Script:FabricItemWarnings = $true
+    return
+  }
+  $expectedRows = Get-CsvRowCount $fixture
   try {
     $modelRows = (Invoke-Fabio -Arguments @('semantic-model', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:SemanticModelId, '--dax', 'EVALUATE ROW("n", COUNTROWS(capacity_plan))', '--query', '[0]."[n]"', '--output', 'plain') -Capture) -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1
     $lakeRows = (Invoke-Fabio -Arguments @('lakehouse', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:LakehouseId, '--sql', 'SELECT COUNT(*) AS n FROM capacity_plan', '--query', '[0].n', '--output', 'plain') -Capture) -split "`n" | Where-Object { $_.Trim() -ne '' } | Select-Object -First 1
-    if (-not [string]::IsNullOrWhiteSpace($modelRows) -and $modelRows.Trim() -eq $lakeRows.Trim()) {
+    if (-not [string]::IsNullOrWhiteSpace($modelRows) -and -not [string]::IsNullOrWhiteSpace($lakeRows) -and $modelRows.Trim() -eq "$expectedRows" -and $lakeRows.Trim() -eq "$expectedRows") {
       Write-Host "PASS: Semantic model agrees with the Lakehouse (capacity_plan = $($modelRows.Trim()) rows)"
     }
     else {
-      Warn "Semantic model is stale: capacity_plan reports $modelRows rows but the Lakehouse reports $lakeRows. Re-run 'fabio semantic-model refresh --type full'."
+      Warn "Semantic model/Lakehouse capacity_plan row counts do not match the fixture: model=$modelRows, Lakehouse=$lakeRows, expected=$expectedRows. Check the load and model framing before refreshing."
       $Script:FabricItemWarnings = $true
     }
   } catch {
     Warn "Semantic model staleness check did not complete: $($_.Exception.Message)"
+    $Script:FabricItemWarnings = $true
+  }
+}
+
+function Resolve-VerificationItems {
+  $Script:OntologyId = Resolve-ExistingOptionalItem 'Ontology' $Script:OntologyName
+  if (-not [string]::IsNullOrWhiteSpace($Script:OntologyId)) {
+    $Script:OntologyStatus = 'resolved'
+  } else {
+    $Script:OntologyStatus = 'failed'
+    Warn "Verification could not resolve ontology '$($Script:OntologyName)'; no item will be created."
+    $Script:FabricItemWarnings = $true
+  }
+  $Script:SemanticModelId = Resolve-ExistingOptionalItem 'SemanticModel' $Script:SemanticModelName
+  if (-not [string]::IsNullOrWhiteSpace($Script:SemanticModelId)) {
+    $Script:SemanticModelStatus = 'resolved'
+  } else {
+    $Script:SemanticModelStatus = 'failed'
+    Warn "Verification could not resolve semantic model '$($Script:SemanticModelName)'; no item will be created."
+    $Script:FabricItemWarnings = $true
+  }
+  $Script:DataAgentId = Resolve-ExistingOptionalItem 'DataAgent' $Script:DataAgentName
+  if (-not [string]::IsNullOrWhiteSpace($Script:DataAgentId)) {
+    $Script:DataAgentStatus = 'resolved'
+    $Script:DataAgentPublished = 'unverified'
+  } else {
+    $Script:DataAgentStatus = 'failed'
+    Warn "Verification could not resolve data agent '$($Script:DataAgentName)'; no item will be created."
+    $Script:FabricItemWarnings = $true
   }
 }
 
 function Invoke-Verification {
   Write-Host 'Running post-load verification...'
+  if ($Script:VerifyOnly -and -not $Script:SkipFabricItems) {
+    Verify-OntologyPeerSurface
+    Verify-DataAgentAct1Answer
+    Invoke-DataAgentEvaluation
+  }
   if ($Script:DryRun) {
     Write-DryRun @('fabio', 'sql-database', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:SqlDatabaseId, '--sql', 'SELECT COUNT_BIG(*) AS value FROM dbo.<table>;', '--query', '[0].value', '--output', 'plain')
     Write-DryRun @('fabio', 'kql-database', 'query', '--workspace', $Script:WorkspaceId, '--id', $Script:KqlDatabaseId, '--kql', 'LineSignals | summarize value=count()', '--query', '[0].value', '--output', 'plain')
@@ -2241,6 +2361,7 @@ function Invoke-Verification {
 function Write-Summary {
   Write-Host ''
   Write-Host 'Deployment summary'
+  Write-Host "  SQL load mode: $($Script:SqlLoadMode)"
   Write-Host "  Workspace: $($Script:WorkspaceId)"
   Write-Host "  Lakehouse: $($Script:LakehouseName) ($($Script:LakehouseId))"
   Write-Host "  Eventhouse: $($Script:EventhouseName) ($($Script:EventhouseId))"
@@ -2262,7 +2383,7 @@ function Write-Summary {
   $semanticModelConnectionId = if ([string]::IsNullOrWhiteSpace($Script:SemanticModelConnectionId)) { '<none>' } else { $Script:SemanticModelConnectionId }
   Write-Host "  Semantic model connection: $semanticModelConnectionId [$($Script:SemanticModelConnectionSource)]"
   $dataAgentId = if ([string]::IsNullOrWhiteSpace($Script:DataAgentId)) { '<none>' } else { $Script:DataAgentId }
-  Write-Host "  Data agent: $($Script:DataAgentName) ($dataAgentId) [$($Script:DataAgentStatus); sources attached: $($Script:DataAgentSourcesAttached); published: $($Script:DataAgentPublished); few-shot verification: $($Script:DataAgentFewshotStatus); few-shot sources verified: $($Script:DataAgentFewshotSourcesVerified); El Nino signal: $($Script:DataAgentElNinoSignalStatus); evaluation: $($Script:DataAgentEvaluationStatus)]"
+  Write-Host "  Data agent: $($Script:DataAgentName) ($dataAgentId) [$($Script:DataAgentStatus); source attachments this run: $($Script:DataAgentSourcesAttached); published: $($Script:DataAgentPublished); few-shot verification: $($Script:DataAgentFewshotStatus); few-shot sources verified: $($Script:DataAgentFewshotSourcesVerified); El Nino signal: $($Script:DataAgentElNinoSignalStatus); evaluation: $($Script:DataAgentEvaluationStatus)]"
   Write-Host "  SQL rows loaded: $($Script:SqlRowsLoaded)"
   Write-Host "  Eventhouse rows loaded: $($Script:EventhouseRowsLoaded)"
   Write-Host "  Lakehouse files uploaded: $($Script:LakehouseFilesUploaded)"
@@ -2317,6 +2438,8 @@ function Main {
     $Script:OntologyBindingStatus = 'skipped'
     $Script:SemanticModelStatus = 'skipped'
     $Script:SemanticModelRefreshStatus = 'skipped'
+  } else {
+    Resolve-VerificationItems
   }
 
   Invoke-Verification

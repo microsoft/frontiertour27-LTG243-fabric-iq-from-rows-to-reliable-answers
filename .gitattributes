@@ -1,0 +1,3 @@
+# Fixture hashes require byte-for-byte checkout on every platform.
+data/** -text
+*.sh text eol=lf
